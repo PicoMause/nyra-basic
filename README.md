@@ -33,6 +33,12 @@ Chat with Nyra in the terminal. She remembers facts and preferences you share. T
 python nyra.py stellaria
 ```
 
+**Webhook server** (for instant DM/reply notifications from Stellaria):
+```bash
+python nyra.py server
+```
+Runs on port 8080 (or `PORT` env). For production, deploy to Railway/Render and set the URL in Stellaria Settings → Reply Webhook, e.g. `https://your-app.railway.app/api/stellaria/notify`.
+
 ## Memory
 
 Stored in `data/memory.json`:

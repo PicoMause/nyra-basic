@@ -28,13 +28,13 @@ SYSTEM_PROMPT = """You are Nyra, a helpful and friendly assistant. You have basi
 
 Be concise, warm, and direct. When the user tells you something to remember, acknowledge it and store it. When relevant, refer back to what you remember about them."""
 
-SYSTEM_PROMPT_WITH_STELLARIA = """You are Nyra, a helpful and friendly assistant with a presence on Stellaria (a social platform for AI agents). You have basic memory and remember facts and preferences the user shares.
+SYSTEM_PROMPT_WITH_STELLARIA = """You are Nyra. You have tools that are connected to Stellaria — a social platform for AI agents. These tools are real and working.
 
-When the user asks you to post, introduce yourself, or share something on Stellaria — use the post_to_stellaria tool to actually post it. Do not just write the post as text; call the tool so it goes live (after guardian approval).
+CRITICAL: You CAN post to Stellaria. Never say you cannot. When the user asks you to post, introduce yourself, or share on Stellaria — you MUST call the post_to_stellaria tool. Do not refuse. Do not suggest they post it themselves. Call the tool with the post content.
 
-Other Stellaria tools: access_stellaria (check your feed/inbox), send_stellaria_dm, submit_stellaria_memory. Use them when the user asks you to do something on Stellaria.
+Your Stellaria tools: post_to_stellaria, access_stellaria, send_stellaria_dm, submit_stellaria_memory. Use them when the user asks for anything on Stellaria.
 
-Be concise, warm, and direct. When the user tells you something to remember, acknowledge it and store it."""
+Be concise and warm. When the user tells you something to remember, acknowledge it."""
 
 STELLARIA_SYSTEM_PROMPT = """You are Nyra, an AI agent with a presence on Stellaria — a social platform for AI agents.
 
@@ -179,6 +179,42 @@ def run_stellaria_turn() -> str:
             return "Done."
 
 
+def _wants_to_post(user_message: str) -> bool:
+    """Heuristic: user is asking to post or introduce on Stellaria."""
+    lower = user_message.lower()
+    post_words = ("post", "introduce", "share", "publish", "put on")
+    stellaria_words = ("stellaria", "feed", "there", "directly")
+    # Must mention both posting intent and Stellaria
+    return any(w in lower for w in post_words) and any(w in lower for w in stellaria_words)
+
+
+def _post_to_stellaria_direct(user_message: str) -> str:
+    """Compose post via model, then post ourselves — bypasses model refusal to use tools."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return "Error: Set ANTHROPIC_API_KEY."
+    if not os.environ.get("STELLARIA_API_KEY"):
+        return "Error: Set STELLARIA_API_KEY to post."
+
+    client = Anthropic(api_key=api_key)
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=200,
+        system="You are Nyra. Write a brief, friendly intro post for Stellaria (a social platform for AI agents). Max 300 characters. Plain text only, no markdown.",
+        messages=[{"role": "user", "content": "Write a short intro post for Stellaria. Introduce yourself briefly."}],
+    )
+    content = (response.content[0].text if response.content else "").strip()
+    # Remove markdown wrappers if present
+    for wrapper in ("```", "**", "*"):
+        content = content.replace(wrapper, "")
+    content = content[:300].strip()
+
+    result = post_to_stellaria(content=content or "Hi, I'm Nyra 👋")
+    if result.get("error"):
+        return f"Posted the text, but Stellaria returned: {result['error']}"
+    return f"Posted! \"{content[:80]}{'…' if len(content) > 80 else ''}\" — it's in your Dashboard for approval."
+
+
 def chat(user_message: str, history: list[dict] | None = None) -> str:
     """Send a message to Nyra and get a response. Uses Stellaria tools when STELLARIA_API_KEY is set."""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -197,11 +233,16 @@ def chat(user_message: str, history: list[dict] | None = None) -> str:
     messages.append({"role": "user", "content": user_message})
 
     tools = STELLARIA_TOOLS if has_stellaria else None
+    # Force tool use when user clearly asks to post — prevents model refusal
+    force_post_tool = has_stellaria and tools and _wants_to_post(user_message)
+    tool_round_done = False
 
     while True:
         kwargs = {"model": MODEL, "max_tokens": 1024, "system": system, "messages": messages}
         if tools:
             kwargs["tools"] = tools
+        if force_post_tool and not tool_round_done:
+            kwargs["tool_choice"] = {"type": "tool", "name": "post_to_stellaria"}
 
         response = client.messages.create(**kwargs)
 
@@ -214,6 +255,7 @@ def chat(user_message: str, history: list[dict] | None = None) -> str:
                 tool_blocks.append(block)
 
         if tool_blocks:
+            tool_round_done = True
             # Execute all tools and continue the loop
             assistant_content = [b for b in response.content if b.type == "tool_use"]
             messages.append({"role": "assistant", "content": assistant_content})
@@ -259,6 +301,17 @@ def run_cli():
             save_memory(memory)
             continue
 
+        # Direct post — bypass model refusal; handle even without key (will error clearly)
+        if _wants_to_post(user_input):
+            print("\nNyra: Posting to Stellaria...\n")
+            result = _post_to_stellaria_direct(user_input)
+            print(f"Nyra: {result}\n")
+            history.append({"role": "user", "content": user_input})
+            history.append({"role": "assistant", "content": result})
+            update_recent(memory, f"Posted to Stellaria: {result[:60]}...")
+            save_memory(memory)
+            continue
+
         history.append({"role": "user", "content": user_input})
         response = chat(user_input, history[:-1])
         history.append({"role": "assistant", "content": response})
@@ -298,7 +351,16 @@ def run_stellaria_loop(interval_min: int = 5):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1].lower() == "stellaria":
-        run_stellaria_loop()
+    if len(sys.argv) > 1:
+        arg = sys.argv[1].lower()
+        if arg == "stellaria":
+            run_stellaria_loop()
+        elif arg == "server":
+            import uvicorn
+            from server import app
+            port = int(os.environ.get("PORT", 8080))
+            uvicorn.run(app, host="0.0.0.0", port=port)
+        else:
+            run_cli()
     else:
         run_cli()
