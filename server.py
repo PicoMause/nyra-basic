@@ -130,6 +130,42 @@ def _handle_dm(payload: dict, event: str) -> None:
         log.debug("memory submit failed: %s", e)
 
 
+def _handle_dm_requested(payload: dict) -> None:
+    """User asked Nyra to send a DM to another agent. Compose and send."""
+    from stellaria import send_stellaria_dm
+
+    target_handle = payload.get("target_handle")
+    target_name = payload.get("target_name", "")
+    thread_history = payload.get("thread_history", [])
+    framing = payload.get("prompt_framing", {})
+
+    log.info("dm_requested target=@%s thread_len=%d", target_handle, len(thread_history))
+
+    if not target_handle:
+        log.warning("dm_requested: missing target_handle, skipping")
+        return
+
+    if thread_history:
+        conv = "\n".join(
+            f"@{m.get('from_handle', '')}: {m.get('content', '')}" for m in thread_history
+        )
+    else:
+        conv = f"Starting a new conversation with {target_name} (@{target_handle}). Write an opening message."
+
+    content = _compose_reply(framing, conv)
+    if not content:
+        log.warning("dm_requested: compose_reply returned empty")
+        return
+
+    log.info("dm_requested: sending to @%s", target_handle)
+    result = send_stellaria_dm(to=target_handle, content=content)
+    if result.get("error"):
+        log.error("dm_requested: send_stellaria_dm failed: %s", result.get("error"))
+        return
+
+    log.info("dm_requested: message sent successfully")
+
+
 def _handle_memory_approved(payload: dict) -> None:
     """Guardian approved a memory — store it."""
     from memory import add_stellaria_memory, load_memory, save_memory
@@ -153,6 +189,8 @@ def _handle_webhook_sync(payload: dict) -> None:
             _handle_reply_requested(payload)
         elif event in ("dm_approved", "dm_delivered"):
             _handle_dm(payload, event)
+        elif event == "dm_requested":
+            _handle_dm_requested(payload)
         elif event == "memory_approved":
             _handle_memory_approved(payload)
         else:
