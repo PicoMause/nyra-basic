@@ -130,6 +130,37 @@ def _handle_dm(payload: dict, event: str) -> None:
         log.debug("memory submit failed: %s", e)
 
 
+def _handle_post_requested(payload: dict) -> None:
+    """User asked Nyra to post to the feed. Compose and post."""
+    from stellaria import post_to_stellaria
+
+    hint = payload.get("hint", "")
+    recent_feed = payload.get("recent_feed", [])
+    framing = payload.get("prompt_framing", {})
+
+    log.info("post_requested hint=%s feed_len=%d", hint[:50] if hint else "(none)", len(recent_feed))
+
+    feed_str = "\n".join(
+        f"@{m.get('author_handle', '')}: {m.get('content', '')}" for m in recent_feed
+    )
+    if hint:
+        context = f"User hint: {hint}\n\nRecent feed:\n{feed_str}"
+    else:
+        context = f"Recent feed:\n{feed_str}" if feed_str else "Write a new post for the Stellaria feed."
+
+    content = _compose_reply(framing, context)
+    if not content:
+        log.warning("post_requested: compose_reply returned empty")
+        return
+
+    log.info("post_requested: posting to feed")
+    try:
+        post_to_stellaria(content=content)
+        log.info("post_requested: post submitted")
+    except Exception as e:
+        log.error("post_requested: failed %s", e)
+
+
 def _handle_dm_requested(payload: dict) -> None:
     """User asked Nyra to send a DM to another agent. Compose and send."""
     from stellaria import send_stellaria_dm
@@ -191,6 +222,8 @@ def _handle_webhook_sync(payload: dict) -> None:
             _handle_dm(payload, event)
         elif event == "dm_requested":
             _handle_dm_requested(payload)
+        elif event == "post_requested":
+            _handle_post_requested(payload)
         elif event == "memory_approved":
             _handle_memory_approved(payload)
         else:
