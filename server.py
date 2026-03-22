@@ -1,9 +1,14 @@
 """Webhook server for Stellaria — handles reply_requested, dm_approved, dm_delivered, memory_approved."""
 
+import logging
 import os
+import sys
 from typing import Any
 
 from fastapi import FastAPI, Request
+
+logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(asctime)s [nyra] %(message)s")
+log = logging.getLogger(__name__)
 from fastapi.responses import JSONResponse
 
 # Nyra's personality for LLM calls
@@ -45,7 +50,10 @@ def _handle_reply_requested(payload: dict) -> None:
     api_key = payload.get("api_key")
     framing = payload.get("prompt_framing", {})
 
+    log.info("reply_requested post_id=%s has_token=%s", post_id, bool(reply_token or api_key))
+
     if not post_id or not (reply_token or api_key):
+        log.warning("reply_requested: missing post_id or auth, skipping")
         return
 
     # Build context from thread
@@ -56,14 +64,19 @@ def _handle_reply_requested(payload: dict) -> None:
 
     reply = _compose_reply(framing, conv)
     if not reply:
+        log.warning("reply_requested: compose_reply returned empty")
         return
 
-    post_to_stellaria(
-        content=reply,
-        reply_to_post_id=post_id,
-        reply_token=reply_token,
-        api_key=api_key,
-    )
+    try:
+        post_to_stellaria(
+            content=reply,
+            reply_to_post_id=post_id,
+            reply_token=reply_token,
+            api_key=api_key,
+        )
+        log.info("reply_requested: reply posted")
+    except Exception as e:
+        log.error("reply_requested: post failed: %s", e)
 
 
 def _handle_dm(payload: dict, event: str) -> None:
@@ -74,27 +87,37 @@ def _handle_dm(payload: dict, event: str) -> None:
     content = payload.get("content")
     framing = payload.get("prompt_framing", {})
 
+    log.info("dm event=%s sender_handle=%s has_content=%s", event, sender_handle, bool(content))
+
     if not sender_handle or not content:
         # Fallback: fetch from access_stellaria if needed
         from stellaria import access_stellaria
 
-        data = access_stellaria()
-        inbox = data.get("inbox", [])
-        if inbox:
-            m = inbox[0]
-            sender_handle = m.get("from_handle", "")
-            content = m.get("content", "")
+        try:
+            data = access_stellaria()
+            inbox = data.get("inbox", [])
+            if inbox:
+                m = inbox[0]
+                sender_handle = m.get("from_handle", "")
+                content = m.get("content", "")
+        except Exception as e:
+            log.error("access_stellaria fallback failed: %s", e)
         if not sender_handle or not content:
+            log.warning("dm: no sender or content, skipping")
             return
 
     reply = _compose_reply(framing, f"Message from @{sender_handle}:\n\n{content}")
     if not reply:
+        log.warning("dm: compose_reply returned empty")
         return
 
+    log.info("dm: sending reply to @%s", sender_handle)
     result = send_stellaria_dm(to=sender_handle, content=reply)
     if result.get("error"):
+        log.error("dm: send_stellaria_dm failed: %s", result.get("error"))
         return
 
+    log.info("dm: reply sent successfully")
     # Optionally submit a memory draft
     try:
         mem_content = _compose_reply(
@@ -103,8 +126,8 @@ def _handle_dm(payload: dict, event: str) -> None:
         )
         if mem_content:
             submit_stellaria_memory(mem_content)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug("memory submit failed: %s", e)
 
 
 def _handle_memory_approved(payload: dict) -> None:
@@ -123,13 +146,19 @@ def _handle_memory_approved(payload: dict) -> None:
 def _handle_webhook_sync(payload: dict) -> None:
     """Process webhook (sync, runs in thread)."""
     event = payload.get("event", "")
+    log.info("webhook event=%s", event)
 
-    if event == "reply_requested":
-        _handle_reply_requested(payload)
-    elif event in ("dm_approved", "dm_delivered"):
-        _handle_dm(payload, event)
-    elif event == "memory_approved":
-        _handle_memory_approved(payload)
+    try:
+        if event == "reply_requested":
+            _handle_reply_requested(payload)
+        elif event in ("dm_approved", "dm_delivered"):
+            _handle_dm(payload, event)
+        elif event == "memory_approved":
+            _handle_memory_approved(payload)
+        else:
+            log.warning("unknown event: %s", event)
+    except Exception as e:
+        log.exception("webhook handler failed: %s", e)
 
 
 @app.post("/api/stellaria/notify")
@@ -143,6 +172,7 @@ async def stellaria_notify(request: Request) -> JSONResponse:
     # Fire-and-forget — respond quickly, process in background thread
     import threading
     threading.Thread(target=_handle_webhook_sync, args=(payload,), daemon=True).start()
+    log.info("webhook received, event=%s", payload.get("event", "?"))
     return JSONResponse({"received": True})
 
 
